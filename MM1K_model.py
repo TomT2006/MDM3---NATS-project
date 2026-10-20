@@ -6,8 +6,8 @@ import simpy
 
 #Horizon_min is the length of simulation in mins
 #Warmup_min is the start of the simulation where the system is empty to remove bias
-def mm1k(arrival_rate=2/3, service_rate=1, K=5, horizon_min=100000,
-         warmup_min=10000, time_scale_min=10, seed=42):
+def mm1k(arrival_rate=2/3, service_rate=1, K=5, horizon_min=1000,
+         warmup_min=60, time_scale_min=10, seed=42):
     #Validate inputs 
     if (not all(isfinite(x) for x in (arrival_rate, service_rate, horizon_min, warmup_min, time_scale_min))
             or arrival_rate <= 0 or service_rate <= 0 or time_scale_min <= 0
@@ -74,6 +74,7 @@ def mm1k(arrival_rate=2/3, service_rate=1, K=5, horizon_min=100000,
     return {"rho": arrival_rate / service_rate, "K": K,
             #Blocking probability: fraction of arrivals lost vs. fraction of time full
             "P_block_simulated": blocked / offered if offered else None,
+            #Share of time that the system is full
             "P_block_time_avg": probs.get(K, 0),
             #Throughput of admitted aircraft per minute
             "lam_eff_simulated": (offered - blocked) / (horizon_min - warmup_min),
@@ -84,6 +85,7 @@ def mm1k(arrival_rate=2/3, service_rate=1, K=5, horizon_min=100000,
             #Mean number in system / in queue
             "L_simulated": sum(n * p for n, p in probs.items()),
             "Lq_simulated": sum(max(n - 1, 0) * p for n, p in probs.items()),
+            #Share of time that the server is working
             "busy_fraction": 1 - probs.get(0, 0),    #utilisation = P(N > 0)
             "state_probabilities": probs}
 

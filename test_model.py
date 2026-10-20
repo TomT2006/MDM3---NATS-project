@@ -6,7 +6,7 @@ import unittest
 
 from model import ScenarioConfig, Simulation
 from results import STAND_STATES, summary, port_statistics, queue_trace, run_until_wait_limit
-from mm1 import mm1
+from MM1K_model import MM1K_model
 
 
 class ModelTests(unittest.TestCase):
