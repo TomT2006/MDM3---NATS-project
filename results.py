@@ -1,91 +1,163 @@
-"""Measurements kept separate from the simulator. All returned times are minutes."""
-from collections import defaultdict
+"""Convert event records to physical measurements; never changes the simulation."""
+from collections import Counter, defaultdict
+import math
+import numpy as np
 
 
-STAND_STATES = {"unloading", "charger_wait", "charging", "boarding", "dispatch_wait"}
+def measurements(sim, start_min=0, end_min=None):
+    """Passenger cohort arrives within window; follow it to the observed run end.
 
-
-def summary(sim, warmup_min=0):
-    """Time fractions include ongoing activities, not just completed journeys."""
-    c = sim.config
-    start, end = c.time(warmup_min), sim.env.now
-    if not 0 <= start < end:
-        raise ValueError("Warm-up must precede the end of this run.")
-    times = defaultdict(float)
-    for aircraft, state, port, left, right in sim.log.intervals(end, start):
-        times[state] += (right - left) * c.time_scale_min
-    arrivals = sum(start <= f.arrival < end - 1e-10 for f in sim.log.flights)
-    elapsed = (end - start) * c.time_scale_min
-    return {"observation_min": elapsed, "completed_flights": arrivals,
-            "flights_per_hour": arrivals * 60 / elapsed,
-            "aircraft_minutes": dict(times),
-            "time_fraction": {state: time / (c.fleet * elapsed) for state, time in times.items()}}
-
-
-def port_statistics(sim, warmup_min=0):
-    """Exact time averages from event intervals; not averages of occasional snapshots."""
+    Resource utilisation and flights use the window itself. Default: whole run.
+    Wait percentiles exclude passengers not yet departed: report their count too.
+    """
     c, end = sim.config, sim.env.now
-    start = c.time(warmup_min)
-    if not 0 <= start < end:
-        raise ValueError("Warm-up must precede the end of this run.")
-    totals = {p: defaultdict(float) for p in sim.ports}
-    for aircraft, state, port, left, right in sim.log.intervals(end, start):
-        if port is None:
-            continue
-        duration = right - left
-        if state in STAND_STATES:
-            totals[port]["stand"] += duration
-        if state in {"takeoff", "landing"}:
-            totals[port]["pad"] += duration
-        totals[port][state] += duration
-    result = {}
-    for port, times in totals.items():
-        caps = c.capacities(port)
-        length = end - start
-        result[port] = {"stand_utilisation": times["stand"] / (length * caps["stands"]),
-                        "charger_utilisation": times["charging"] / (length * caps["chargers"]),
-                        "pad_utilisation": times["pad"] / (length * caps["pads"]),
-                        "mean_dispatch_queue": times["dispatch_wait"] / length,
-                        "mean_charger_queue": times["charger_wait"] / length}
+    left = c.time(start_min)
+    right = end if end_min is None else c.time(end_min)
+    if not 0 <= left < right <= end + 1e-9:
+        raise ValueError("Measurement window must be inside the completed run.")
+    minutes = float((right - left) * c.time_scale_min)
+    people = [p for p in sim.passengers if left <= p.arrived < right]
+    departed = [p for p in people if p.departed is not None]
+    completed = [p for p in people if p.completed is not None]
+    waits = [float((p.departed - p.arrived) * c.time_scale_min) for p in departed]
+    timely = sum(w <= c.wait_target_min + 1e-8 for w in waits)
+    flights = [f for f in sim.flights if f.departed is not None and left <= f.departed < right]
+    service = [f for f in flights if f.kind == 'service']
+    scheduled = [f for f in sim.flights if f.kind == 'service' and left <= f.scheduled < right]
+    delays = [float((f.departed - f.scheduled) * c.time_scale_min) for f in service]
+    state_time = Counter()
+    port_time = {p: Counter() for p in sim.ports}
+    for aircraft, state, port, a, b in sim.log.intervals(right, left):
+        state_time[state] += float((b - a) * c.time_scale_min)
+        if port is not None:
+            port_time[port][state] += float((b - a) * c.time_scale_min)
+    grid_kwh = 0
+    for aircraft, port, a, b, before, after in sim.log.charges:
+        overlap = max(0, min(right, b) - max(left, a))
+        grid_kwh += overlap / (b - a) * (after - before) * c.battery_kwh / c.charging_efficiency
+    pad_load, charger_load, request_load = {}, {}, {}
+    for p, v in sim.ports.items():
+        pad_load[p] = (port_time[p]['takeoff'] + port_time[p]['landing']) / minutes
+        charger_load[p] = port_time[p]['charging'] / (minutes * v.chargers.capacity) if v.chargers else 0
+        request_load[p] = v.queue.statistics(left, right)
+    n = len(people)
+    result = dict(arrivals=n, completed=len(completed), not_completed=n-len(completed),
+                  departed=len(departed), not_departed=n-len(departed),
+                  unassigned=sum(p.flight is None for p in people),
+                  assigned_not_departed=sum(p.flight is not None and p.departed is None for p in people),
+                  departed_not_completed=sum(p.departed is not None and p.completed is None for p in people),
+                  served_fraction=len(completed)/n if n else None,
+                  timely_fraction=timely/n if n else None,
+                  mean_wait_min=float(np.mean(waits)) if waits else None,
+                  p95_wait_min=float(np.percentile(waits,95)) if waits else None,
+                  flights=len(flights), service_flights=len(service),
+                  reposition_flights=sum(f.kind == 'reposition' for f in flights),
+                  flight_rate_per_hour=len(flights)/(minutes/60),
+                  passengers_per_hour=len([p for p in sim.passengers if p.completed is not None and left <= p.completed < right])/(minutes/60),
+                  load_factor=sum(len(f.passengers) for f in flights)/(c.seats*len(flights)) if flights else 0,
+                  service_load_factor=sum(len(f.passengers) for f in service)/(c.seats*len(service)) if service else 0,
+                  mean_delay_min=float(np.mean(delays)) if delays else None,
+                  p95_delay_min=float(np.percentile(delays,95)) if delays else None,
+                  reassignments=sum(f.preferred_aircraft is not None and f.aircraft != f.preferred_aircraft for f in service),
+                  scheduled_status=dict(Counter(f.status for f in scheduled)),
+                  cancellation_reasons=dict(Counter(f.cancel_reason for f in scheduled if f.status == 'cancelled')),
+                  state_fraction={k: v/(minutes*c.fleet) for k,v in state_time.items()},
+                  pad_utilisation=pad_load, charger_utilisation=charger_load,
+                  aircraft_queues=request_load, admission_deferrals=sum(left <= t < right for t,_,_ in sim.log.deferrals),
+                  grid_kwh=float(grid_kwh), observed_minutes=minutes,
+                  flying_fraction=sum(state_time[x] for x in ('takeoff','cruise','landing'))/(minutes*c.fleet),
+                  airborne_wait_fraction=state_time['arrival_pad_wait']/(minutes*c.fleet),
+                  charging_fraction=state_time['charging']/(minutes*c.fleet))
+    result['passes_targets'] = n > 0 and result['served_fraction'] >= c.served_target and result['timely_fraction'] >= c.timely_target
+    if c.costs is not None:
+        costs = c.costs
+        result['scenario_contribution'] = (len([p for p in sim.passengers if p.completed is not None and left <= p.completed < right])*costs['fare']
+            - len(flights)*costs['per_flight'] - grid_kwh*costs['per_grid_kwh']
+            - c.fleet*(minutes/60)*costs['per_aircraft_hour'])
     return result
 
 
-def queue_trace(sim, port, state="dispatch_wait"):
-    """Step-plot coordinates in minutes, with simultaneous changes combined."""
-    changes = defaultdict(int)
-    for aircraft, activity, location, left, right in sim.log.intervals(sim.env.now):
-        if activity == state and location == port:
-            # Merge numerically equal event times; avoid floating-point queue spikes.
-            changes[round(left, 10)] += 1
-            changes[round(right, 10)] -= 1
-    times, lengths, count = [0.0], [0], 0
-    for time, change in sorted(changes.items()):
-        if time >= sim.env.now - 1e-10:  # Do not invent an empty queue at the cutoff
-            continue
-        count += change
-        times.append(time * sim.config.time_scale_min)
-        lengths.append(count)
-    times.append(sim.env.now * sim.config.time_scale_min)
-    lengths.append(count)
-    return times, lengths
+def audit(sim):
+    """Physical/conservation checks, independent of the scheduler's decisions."""
+    c, eps = sim.config, 1e-7
+    for t, allocated in sim.log.allocations:
+        assert sum(allocated.values()) == c.fleet, 'Lost aircraft stand claim'
+        assert all(0 <= n <= sim.ports[p].stands for p,n in allocated.items()), 'Stand claims exceed capacity'
+    chargers, routes = defaultdict(list), defaultdict(list)
+    names = {a.name for a in sim.aircraft}
+    flights = {f.name:f for f in sim.flights}
+    aircraft_intervals = defaultdict(list)
+    for port, v in sim.ports.items():
+        assert v.queue.audit()
+        for t in v.queue.tickets:
+            assert not t.blocked, 'Operating aircraft was discarded'
+            assert t.aircraft in names and t.flight in flights, 'Invented aircraft or flight'
+            f = flights[t.flight]
+            assert f.aircraft == t.aircraft, 'Queue aircraft differs from assignment'
+            aircraft_intervals[t.aircraft].append((t.arrived, t.completed or sim.env.now))
+            if t.operation == 'takeoff':
+                assert port == f.route.origin
+                assert t.arrived + eps >= f.scheduled, 'Premature departure admission'
+                assert t.completed == f.departed
+            else:
+                assert port == f.route.dest and f.departed is not None
+                assert abs(t.arrived-f.departed-f.route.flight_time) < eps, 'Landing before flight'
+                assert t.completed == f.landed
+        for (fid, operation), aircraft in v.queue.reservations.items():
+            assert fid in flights and aircraft == flights[fid].aircraft, 'Orphan permit'
+    for intervals in aircraft_intervals.values():
+        intervals.sort()
+        assert all(b <= x+eps for (a,b),(x,y) in zip(intervals,intervals[1:])), 'Aircraft in two queues'
+    for f in sim.flights:
+        if f.departed is not None:
+            routes[f.route.origin, f.route.dest].append(f.departed)
+    for departures in routes.values():
+        departures.sort()
+        assert all(b-a+eps >= c.time(c.headway_min) for a,b in zip(departures,departures[1:])), 'Headway violation'
+    for name, port, a, b, before, after in sim.log.charges:
+        assert sim.ports[port].chargers is not None, 'Charging at unequipped port'
+        assert 0 <= before <= after <= 1+eps, 'Invalid charge'
+        chargers[port].extend([(a,1),(b,-1)])
+    for port, events in chargers.items():
+        count = 0
+        for t, delta in sorted(events):
+            count += delta
+            assert 0 <= count <= sim.ports[port].chargers.capacity, 'Charger overbooking'
+    flights = {f.name:f for f in sim.flights}
+    for name, t, before, after, fid in sim.log.energy_used:
+        f = flights[fid]
+        assert before+eps >= sim.required(f.route), 'Unsafe energy dispatch'
+        assert abs(before-after-f.route.energy) < eps, 'Flight energy debit'
+        assert after+eps >= c.reserve_soc, 'Reserve violation'
+    for a in sim.aircraft:
+        added = sum((after-before)*max(0,min(1,(sim.env.now-start)/(end-start)))
+                    for name,port,start,end,before,after in sim.log.charges if name == a.name)
+        used = sum(before-after for name,t,before,after,fid in sim.log.energy_used if name == a.name)
+        assert abs(a.soc-(c.initial_soc+added-used)) < eps, 'Energy balance'
+        assert c.reserve_soc-eps <= a.soc <= 1+eps, 'Invalid current battery'
+    assigned = [p.name for f in sim.flights for p in f.passengers]
+    assert len(assigned) == len(set(assigned)), 'Passenger assigned twice'
+    for f in sim.flights:
+        assert len(f.passengers) <= c.seats, 'Too many passengers'
+        for p in f.passengers:
+            assert (p.origin,p.dest) == (f.route.origin,f.route.dest) and p.flight == f.name, 'Wrong destination'
+            times = [t for t in (p.arrived,p.boarded,p.departed,p.completed) if t is not None]
+            assert times == sorted(times), 'Passenger event order'
+    for v in sim.ports.values():
+        assert all(0 <= n <= v.queue.capacity for t,n in v.queue.history), 'K exceeded'
+    total = sum(b-a for name,state,port,a,b in sim.log.intervals(sim.env.now))
+    assert abs(total-c.fleet*sim.env.now) < eps*max(1,c.fleet), 'Aircraft time not conserved'
+    return True
 
 
-def run_until_wait_limit(sim, wait_limit_min=30, check_every_min=1):
-    """Optional operational stop: inspect current waits at regular checkpoints.
-
-    Detects a dispatch/charger wait reaching the threshold at a checkpoint;
-    brief breaches between checkpoints can be missed. Not a physical safety test.
-    """
-    if wait_limit_min <= 0 or check_every_min <= 0:
-        raise ValueError("Wait limit and check interval must be positive.")
-    c = sim.config
-    while sim.env.now < c.time(c.horizon_min) - 1e-10:
-        now_min = sim.env.now * c.time_scale_min
-        sim.run(min(now_min + check_every_min, c.horizon_min))
-        for aircraft, history in sim.log.states.items():
-            time, state, port = history[-1]
-            waited = (sim.env.now - time) * c.time_scale_min
-            if state in {"dispatch_wait", "charger_wait"} and waited >= wait_limit_min - 1e-8:
-                return {"reason": state, "aircraft": aircraft, "port": port,
-                        "detected_at_min": sim.env.now * c.time_scale_min, "wait_min": waited}
-    return None
+def waiting_trace(sim, times_min):
+    """Passenger waiting, charger waiting, actual pad N and future permits R."""
+    values = []
+    for minute in times_min:
+        t = sim.config.time(minute)
+        passenger = sum(p.arrived <= t and (p.boarded is None or p.boarded > t) for p in sim.passengers)
+        charging = sum(state == 'charger_wait' and a <= t < b for _,state,port,a,b in sim.log.intervals(sim.env.now))
+        operations = sum(next(n for at,n in reversed(v.queue.history) if at <= t) for v in sim.ports.values())
+        reserved = sum(next(n for at,n in reversed(v.queue.reservation_history) if at <= t) for v in sim.ports.values())
+        values.append((passenger,charging,operations,reserved))
+    return np.array(values)
