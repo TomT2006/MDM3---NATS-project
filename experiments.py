@@ -31,7 +31,7 @@ def fingerprint(config):
     """Changing configuration OR model code invalidates the saved results."""
     folder=Path(__file__).resolve().parent
     payload=json.dumps(serialise(asdict(config)),sort_keys=True).encode()
-    for filename in ('model.py','queues.py','results.py','mm1k.py','experiments.py'):
+    for filename in ('model.py','safety.py','queues.py','results.py','mm1k.py','experiments.py'):
         payload += (folder/filename).read_bytes()
     return sha256(payload).hexdigest()
 

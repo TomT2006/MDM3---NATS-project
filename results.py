@@ -68,7 +68,33 @@ def measurements(sim, start_min=0, end_min=None):
                   flying_fraction=sum(state_time[x] for x in ('takeoff','cruise','landing'))/(minutes*c.fleet),
                   airborne_wait_fraction=state_time['arrival_pad_wait']/(minutes*c.fleet),
                   charging_fraction=state_time['charging']/(minutes*c.fleet))
-    result['passes_targets'] = n > 0 and result['served_fraction'] >= c.served_target and result['timely_fraction'] >= c.timely_target
+    decisions = [d for d in sim.log.safety_checks if start_min <= d['checked_min'] < float(right*c.time_scale_min)]
+    rejected = [d for d in decisions if not d['allowed']]
+    committed = [d for d in decisions if d['committed']]
+    holds = list(sim.log.holding_used)
+    for a in sim.aircraft:
+        if a.holding is not None:
+            start, before, fid = a.holding
+            holds.append((a.name, start, end, before, a.soc, fid))
+    holding_kwh = sum(float(max(0, min(right,b)-max(left,a))*c.time_scale_min)*c.holding_kw/60
+                      for name,a,b,before,after,fid in holds)
+    result.update(
+        dispatches_approved=len(committed),
+        rejected_candidate_pairs=len({(d['flight'],d['aircraft']) for d in rejected}),
+        rejected_service_flights=len({d['flight'] for d in rejected if d['flight'].startswith('F')}),
+        safety_rejection_reasons=dict(Counter(d['reason'] for d in rejected)),
+        nominal_rotation_conflicts=sum(d['next_nominal_feasible'] is False for d in committed),
+        holding_kwh=holding_kwh,
+        holding_allowance_exceedances=sum(
+            float((b-a)*c.time_scale_min) > sim.safety.hold_minutes[next(f.route.dest for f in sim.flights if f.name==fid)]+1e-8
+            for name,a,b,before,after,fid in holds),
+        safety_failures=len(sim.log.failures),
+        stopped_for_safety=sim.failure_event.triggered,
+        minimum_soc=min([c.initial_soc]+[a.soc for a in sim.aircraft]+
+                        [after for name,t,before,after,fid in sim.log.energy_used]+
+                        [after for name,a,b,before,after,fid in holds]),
+        all_dispatches_approved=all(f.safety is not None and f.safety.allowed for f in flights))
+    result['passes_targets'] = not sim.failure_event.triggered and n > 0 and result['served_fraction'] >= c.served_target and result['timely_fraction'] >= c.timely_target
     if c.costs is not None:
         costs = c.costs
         result['scenario_contribution'] = (len([p for p in sim.passengers if p.completed is not None and left <= p.completed < right])*costs['fare']
@@ -129,10 +155,22 @@ def audit(sim):
         assert before+eps >= sim.required(f.route), 'Unsafe energy dispatch'
         assert abs(before-after-f.route.energy) < eps, 'Flight energy debit'
         assert after+eps >= c.reserve_soc, 'Reserve violation'
+    for name, start, end, before, after, fid in sim.log.holding_used:
+        expected = float((end-start)*c.time_scale_min)*c.holding_kw/(60*c.battery_kwh)
+        assert abs(before-after-expected) < eps, 'Holding energy debit'
+        assert after+eps >= c.reserve_soc, 'Unreported reserve crossing'
+    for f in sim.flights:
+        if f.aircraft is not None:
+            assert f.safety is not None and f.safety.allowed, 'Dispatch without approval'
+            assert f.safety.soc+eps >= f.safety.required_soc
+            assert f.safety.charger_wait_min <= c.max_charger_wait_min+eps
     for a in sim.aircraft:
         added = sum((after-before)*max(0,min(1,(sim.env.now-start)/(end-start)))
                     for name,port,start,end,before,after in sim.log.charges if name == a.name)
         used = sum(before-after for name,t,before,after,fid in sim.log.energy_used if name == a.name)
+        used += sum(before-after for name,start,end,before,after,fid in sim.log.holding_used if name == a.name)
+        if a.holding is not None:
+            used += a.holding[1]-a.soc
         assert abs(a.soc-(c.initial_soc+added-used)) < eps, 'Energy balance'
         assert c.reserve_soc-eps <= a.soc <= 1+eps, 'Invalid current battery'
     assigned = [p.name for f in sim.flights for p in f.passengers]

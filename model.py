@@ -12,6 +12,7 @@ from math import isfinite, inf
 import random
 import simpy
 from queues import AircraftPadQueue
+from safety import SafetyPolicy
 
 
 @dataclass
@@ -43,6 +44,10 @@ class ScenarioConfig:
     reserve_soc: float = 0.15
     charge_trigger_soc: float = 0.6
     charge_target_soc: float = 0.9
+    holding_kw: float = 30                # Synthetic airborne holding power
+    holding_quantile: float = 0.99        # Per-landing queue allowance, not a guarantee
+    mission_energy_margin: float = 0.10   # Extra planned energy, not an automatic debit
+    max_charger_wait_min: float = 60      # Operational forecast limit
     total_demand_per_hour: float = 36
     demand_per_hour: dict = None           # Optional directed-route rates
     demand_mode: str = "poisson"           # Or regular, for hand checks
@@ -96,7 +101,8 @@ class ScenarioConfig:
         nonnegative = (self.headway_min, self.taxi_out_min, self.taxi_in_min, self.first_departure_min,
                        self.board_min_per_passenger, self.unload_min_per_passenger,
                        self.vertical_energy_kwh, self.cruise_kwh_per_km, self.total_demand_per_hour,
-                       self.max_assignment_delay_min, self.ground_delay_mean_min, self.wait_target_min)
+                       self.max_assignment_delay_min, self.ground_delay_mean_min, self.wait_target_min,
+                       self.holding_kw, self.mission_energy_margin, self.max_charger_wait_min)
         if any(not isfinite(x) or x <= 0 for x in positive) or any(not isfinite(x) or x < 0 for x in nonnegative):
             raise ValueError("Durations, energy and rates must have valid finite signs.")
         if not 0 < self.demand_stop_min <= self.horizon_min or not isfinite(self.demand_stop_min):
@@ -107,6 +113,8 @@ class ScenarioConfig:
             raise ValueError("Invalid charge fractions or reserve.")
         if not 0 < self.charging_efficiency <= 1 or not all(0 <= x <= 1 for x in (self.served_target, self.timely_target)):
             raise ValueError("Efficiency and service targets are fractions.")
+        if not 0 < self.holding_quantile < 1 or self.mission_energy_margin > 1:
+            raise ValueError("Holding quantile must be between 0 and 1; energy margin between 0 and 1.")
         if self.demand_mode not in {"poisson", "regular"} or type(self.seed) is not int:
             raise ValueError("Use poisson/regular demand and an integer seed.")
         if set(self.port_overrides) - set(self.port_names):
@@ -181,12 +189,14 @@ class Flight:
     landed: float = None
     completed: float = None
     cancel_reason: str = None
+    safety: object = None                 # Dispatch decision, including charging forecast
 
 
 class Vertiport:
     def __init__(self, env, capacities, seed, time_scale):
         self.stands, self.allocated = capacities['stands'], 0
         self.chargers = simpy.Resource(env, capacities['chargers']) if capacities['chargers'] else None
+        self.charge_order = []            # FCFS requests, registered before processes run
         self.charger_kw = capacities['charger_kw']
         self.queue = AircraftPadQueue(env, capacities['K'], 1/capacities['pad_service_mean_min'], seed, time_scale)
 
@@ -195,6 +205,7 @@ class Recorder:
     def __init__(self):
         self.states, self.allocations = {}, []
         self.charges, self.energy_used, self.deferrals = [], [], []
+        self.holding_used, self.safety_checks, self.failures = [], [], []
 
     def state(self, aircraft, time, state, port):
         self.states.setdefault(aircraft, []).append((time, state, port))
@@ -212,11 +223,15 @@ class Aircraft:
     def __init__(self, sim, name, port):
         self.sim, self.name, self.port = sim, name, port
         self.busy, self.base_soc, self.charging = False, sim.config.initial_soc, None
-        self.clearance = None
+        self.clearance, self.holding = None, None
         self.set_state("idle")
 
     @property
     def soc(self):
+        if self.holding is not None:
+            start, before, fid = self.holding
+            c = self.sim.config
+            return before-float((self.sim.env.now-start)*c.time_scale_min)*c.holding_kw/(60*c.battery_kwh)
         if self.charging is None:
             return self.base_soc
         start, end, before, after = self.charging
@@ -228,6 +243,19 @@ class Aircraft:
     def activity(self, state, duration):
         self.set_state(state)
         yield self.sim.env.timeout(duration)
+
+    def start_charge(self):
+        self.busy = True
+        self.sim.ports[self.port].charge_order.append(self)
+        self.sim.env.process(self.charge())
+
+    def finish_holding(self):
+        if self.holding is not None:
+            start, before, fid = self.holding
+            after = self.soc
+            self.sim.log.holding_used.append((self.name, start, self.sim.env.now, before, after, fid))
+            self.base_soc, self.holding = after, None
+        self.set_state('landing')
 
     def charge(self):
         s, c = self.sim, self.sim.config
@@ -243,6 +271,7 @@ class Aircraft:
                 s.log.charges.append((self.name, self.port, *self.charging))
                 yield from self.activity("charging", end - start)
                 self.base_soc, self.charging = target, None
+        port.charge_order.remove(self)
         self.busy = False
         self.set_state("idle")
 
@@ -266,14 +295,26 @@ class Aircraft:
         for p in flight.passengers:
             p.departed = s.env.now
         before = self.base_soc
+        assert flight.safety.allowed and before+1e-9 >= s.required(flight.route)
         self.base_soc -= flight.route.energy
         s.log.energy_used.append((self.name, s.env.now, before, self.base_soc, flight.name))
         self.port = None
         yield from self.activity("cruise", flight.route.flight_time)
         self.port = flight.route.dest
         self.set_state("arrival_pad_wait")
+        self.holding = (s.env.now, self.base_soc, flight.name)
         ticket = s.ports[self.port].queue.arrive((flight.name, 'landing'), self.name,
-                                                lambda: self.set_state('landing'))
+                                                self.finish_holding)
+        if c.holding_kw > 0:
+            minutes = max(0, (self.base_soc-c.reserve_soc)*c.battery_kwh*60/c.holding_kw)
+            reserve_time = s.env.timeout(c.time(minutes))
+            yield ticket.start_event | reserve_time
+            if ticket.started is None:
+                s.log.failures.append(dict(time_min=float(s.env.now*c.time_scale_min),
+                    aircraft=self.name, flight=flight.name, reason='holding reached protected reserve'))
+                if not s.failure_event.triggered:
+                    s.failure_event.succeed(s.log.failures[-1])
+                return  # Run stops here, rather than continuing with depleted energy.
         yield ticket.done
         flight.landed = s.env.now
         yield from self.activity("taxi_in", c.time(c.taxi_in_min))
@@ -316,8 +357,7 @@ class Scheduler:
             needs = [s.required(f.route) for f in due if f.route.origin == a.port]
             if a.soc < c.charge_target_soc - 1e-9 and (a.soc < c.charge_trigger_soc or
                                                       (needs and a.soc < min(needs))):
-                a.busy = True
-                s.env.process(a.charge())
+                a.start_charge()
         for f in due:
             origin = f.route.origin
             if origin in requests or f.route.departure_pending:
@@ -327,10 +367,17 @@ class Scheduler:
                 if s.env.now >= f.scheduled - 1e-9:
                     f.status, f.cancel_reason = "cancelled", "no passengers"
                 continue
-            ready = [a for a in s.aircraft if not a.busy and a.port == origin and
-                     a.soc + 1e-9 >= s.required(f.route)]
+            ready = []
+            for a in s.aircraft:
+                if not a.busy and a.port == origin:
+                    decision = s.safety.assess(a, f, len(passengers))
+                    s.safety.record(decision)
+                    if decision.allowed:
+                        ready.append((a, decision))
             if ready:
-                a = min(ready, key=lambda a: (a.name != f.preferred_aircraft, -a.soc, a.name))
+                a, decision = min(ready, key=lambda pair: (
+                    pair[0].name != f.preferred_aircraft, -pair[0].soc, pair[0].name))
+                f.safety = decision
                 requests[origin] = (a, f, passengers)
         # Energy recovery from non-charging ports, then empty moves towards unmet demand.
         for a in s.aircraft:
@@ -355,7 +402,11 @@ class Scheduler:
                 route = s.routes[a.port, target]
                 if not route.departure_pending and a.soc + 1e-9 >= s.required(route):
                     f = Flight(f"R{len(s.flights)}_{a.port}", route, s.env.now, kind="reposition")
-                    requests[a.port] = (a, f, [])
+                    decision = s.safety.assess(a, f)
+                    s.safety.record(decision)
+                    if decision.allowed:
+                        f.safety = decision
+                        requests[a.port] = (a, f, [])
         return requests
 
     def choose_batch(self, requests):
@@ -384,6 +435,25 @@ class Scheduler:
                     # A retry is not a lost aircraft. Keep everyone on the ground.
                     s.log.deferrals.append((s.env.now, tuple(f.name for a,f,p in batch), tuple(full)))
                     batch = []
+            # Refresh forecasts sequentially so one batch includes its own
+            # earlier commitments in the charging workload. No time elapses.
+            if batch:
+                checked = []
+                for a, f, people in batch:
+                    f.safety = s.safety.assess(a, f, len(people))
+                    s.safety.record(f.safety)
+                    if not f.safety.allowed:
+                        break
+                    checked.append(f)
+                    f.status, f.aircraft = 'assigned', a.name
+                    if f.kind == 'reposition':
+                        s.safety.tentative.append(f)
+                valid = len(checked) == len(batch)
+                for f in checked:
+                    f.status, f.aircraft = 'pending', None
+                s.safety.tentative.clear()
+                if not valid:
+                    batch = []
             if not batch:
                 yield s.env.timeout(c.time(c.decision_interval_min))
                 continue
@@ -391,6 +461,7 @@ class Scheduler:
             for a, f, passengers in batch:
                 if f.kind == 'reposition':
                     s.flights.append(f)
+                s.safety.record(f.safety, committed=True)
                 a.busy, a.clearance = True, s.env.event()
                 f.aircraft, f.passengers, f.status = a.name, passengers, 'assigned'
                 f.route.departure_pending = True
@@ -416,10 +487,12 @@ class Simulation:
         self.config.validate()
         c = self.config
         self.env, self.log = simpy.Environment(), Recorder()
+        self.failure_event = self.env.event()
         self.ports = {p: Vertiport(self.env, c.capacities(p), c.seed+2000003+i, c.time_scale_min)
                       for i,p in enumerate(c.port_names)}
         self.routes = {(a, b): Route(a, b, c.time(60 * d / c.speed_kmh), c.energy(d))
                        for (a, b), d in c.network().items()}
+        self.safety = SafetyPolicy(self)
         self._paths()
         counts = dict(c.initial_counts) if c.initial_counts is not None else {p: 0 for p in c.port_names}
         if c.initial_counts is None:
@@ -459,8 +532,9 @@ class Simulation:
         # Bellman relaxation: least-energy path to any charging port, directed routes.
         for _ in self.ports:
             for (a, b), r in self.routes.items():
-                if r.energy + self.escape[b] < self.escape[a]:
-                    self.escape[a], self.escape_next[a] = r.energy + self.escape[b], b
+                cost = self.safety.leg_budget(r)
+                if cost + self.escape[b] < self.escape[a]:
+                    self.escape[a], self.escape_next[a] = cost + self.escape[b], b
         if any(not isfinite(value) for value in self.escape.values()):
             raise ValueError("Every port must have a directed path to a charger.")
         if any(self.required(r) > 1 + 1e-9 for r in self.routes.values()):
@@ -477,7 +551,7 @@ class Simulation:
                         self.path[a, b] = self.path[a, k]
 
     def required(self, route):
-        return route.energy + self.escape[route.dest] + self.config.reserve_soc
+        return self.safety.leg_budget(route) + self.escape[route.dest] + self.config.reserve_soc
 
     def _schedule(self, given):
         c, services = self.config, []
@@ -534,7 +608,9 @@ class Simulation:
         end = self.config.time(self.config.horizon_min if until_min is None else until_min)
         if not isfinite(end) or end <= self.env.now:
             raise ValueError("Run to a later finite absolute time.")
-        self.env.run(until=end)
+        if self.failure_event.triggered:
+            raise ValueError("This run stopped at its energy failure; start a new scenario.")
+        self.env.run(until=self.env.timeout(end-self.env.now) | self.failure_event)
         return self
 
 

@@ -60,6 +60,14 @@ def rotation(sim, hours=4):
         events=[]
         for n,t,before,after,fid in sim.log.energy_used:
             if n==name: events.append((float(t),before,after))
+        holds = list(sim.log.holding_used)
+        for aircraft in sim.aircraft:
+            if aircraft.holding is not None:
+                start, before, fid = aircraft.holding
+                holds.append((aircraft.name, start, sim.env.now, before, aircraft.soc, fid))
+        for n,a,b,before,after,fid in holds:
+            if n == name:
+                events.extend([(float(a),before,before),(float(b),after,after)])
         for n,p,a,b,before,after in sim.log.charges:
             if n==name:
                 actual_end=min(float(b),float(sim.env.now))
@@ -188,3 +196,28 @@ def aircraft_queues(sim):
                 title='All ports; excludes preparation and charger waiting')
     axes[1].legend(fontsize=8)
     finish(fig,'09_aircraft_pad_queues.png')
+
+
+def safety_summary(sim):
+    """Decision margins, charging workload and measured holding exposure."""
+    c = sim.config
+    rows = [d for d in sim.log.safety_checks if d['committed']]
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    axes[0].scatter([d['checked_min']/60 for d in rows],
+                    [100*d['margin_soc'] for d in rows], s=15, color='#2677ad')
+    axes[0].axhline(0, color='#c65b47', ls='--')
+    axes[0].set(xlabel='Assignment time (h)', ylabel='Battery above dispatch budget (%)',
+                title='Approved aircraft only')
+    axes[1].hist([d['charger_wait_min'] for d in rows], bins=12, color='#efad35')
+    axes[1].axvline(c.max_charger_wait_min, color='#c65b47', ls='--', label='Dispatch limit')
+    axes[1].set(xlabel='Forecast charger wait (min)', ylabel='Approved assignments')
+    axes[1].legend(fontsize=8)
+    for port, v in sim.ports.items():
+        waits = [float((t.started-t.arrived)*c.time_scale_min) for t in v.queue.tickets
+                 if t.operation=='landing' and t.started is not None]
+        axes[2].scatter([port]*len(waits), waits, s=12, alpha=.4, color='#2677ad')
+        axes[2].scatter([port], [sim.safety.hold_minutes[port]], marker='_', s=400,
+                        color='#c65b47', label='Planning allowance' if port==list(sim.ports)[0] else None)
+    axes[2].set(xlabel='Arrival port', ylabel='Landing queue wait (min)', title='Observed waits and allowance')
+    axes[2].legend(fontsize=8)
+    finish(fig, '10_safety_checks.png')

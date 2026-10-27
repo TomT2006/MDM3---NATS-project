@@ -19,6 +19,7 @@ class Ticket:
     flight: str
     operation: str
     done: object
+    start_event: object = None
     blocked: bool = False
     started: object = None
     completed: object = None
@@ -72,6 +73,7 @@ class AircraftPadQueue:
         if operation not in ('takeoff', 'landing'):
             raise ValueError('Pad operation must be takeoff or landing.')
         t = Ticket(len(self.tickets)+1, self.env.now, aircraft, flight, operation, self.env.event())
+        t.start_event = self.env.event()
         self.tickets.append(t)
         if not self.fits():
             t.blocked = True
@@ -86,6 +88,7 @@ class AircraftPadQueue:
         with self.server.request() as request:
             yield request
             ticket.started = self.env.now
+            ticket.start_event.succeed()
             if on_start is not None:
                 on_start()
             minutes = self.rng.expovariate(self.service_rate)
