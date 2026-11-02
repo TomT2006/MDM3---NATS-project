@@ -58,8 +58,7 @@ def mean_or_zero(values):
     return statistics.mean(values)
 
 
-# same routes and arrival/departure timetable for each charging method so that they
-are comparible
+# same routes and arrival/departure timetable for each charging method so that they are comparible
 def make_flight_plans(fleet_size, seed):
     plans = {}
 
@@ -238,12 +237,20 @@ def evtol(env, aircraft, chargers, method, target, results):
         port = destination
         arrival_time = env.now
 
+        results["arrivals_by_port"][port].append(arrival_time) # dictionary for arrival times to test gaps using lilliefors 
         results["flights"] += 1
         results["flights_by_port"][port] += 1
         results["flights_per_aircraft"][aircraft["id"]] += 1
 
 
-def run_simulation(method, target, fleet_size, seed, flight_plans=None):
+def run_simulation(
+    method,
+    target,
+    fleet_size,
+    seed,
+    flight_plans=None,
+    record_arrivals=False
+):
     if flight_plans is None:
         flight_plans = make_flight_plans(fleet_size, seed)
 
@@ -273,6 +280,7 @@ def run_simulation(method, target, fleet_size, seed, flight_plans=None):
         "queue_entries": {p: 0 for p in ports},
         "waits_by_port": {p: [] for p in ports},
         "flights_by_port": {p: 0 for p in ports},
+        "arrivals_by_port": {p: [] for p in ports},
         "flights_per_aircraft": {
             i: 0 for i in range(fleet_size)
         }
@@ -332,7 +340,7 @@ def run_simulation(method, target, fleet_size, seed, flight_plans=None):
     else:
         on_time_percent = 0
 
-    return {
+    simulation_result = {
         "method": method,
         "target": target,
         "fleet": fleet_size,
@@ -359,6 +367,11 @@ def run_simulation(method, target, fleet_size, seed, flight_plans=None):
             max(utilisation.values()) - min(utilisation.values())
         )
     }
+
+    if record_arrivals:
+        simulation_result["arrivals_by_port"] = results["arrivals_by_port"]
+
+    return simulation_result
 
 
 def save_csv(filename, rows):
@@ -791,6 +804,5 @@ def run_experiments():
 
 if __name__ == "__main__":
     run_experiments()
-
 
 
