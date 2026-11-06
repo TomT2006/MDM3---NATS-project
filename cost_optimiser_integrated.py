@@ -310,7 +310,22 @@ if __name__ == "__main__":
         rows = run_parameter_sweep(
             parameter="stands_per_port",
             values=np.linspace(2, 8, 7),
-            seeds=(1, 2, 3),
+            seeds=range(1,31),
             csv_path="stands_sweep.csv",
             make_plot=True,
         )
+        sweeps = [("fleet", range(4,13), "fleet_sweep.csv"),
+                  ("stands_per_port", [1,2,3,4], "stands_sweep.csv"),
+        ]
+
+        for parameter, values, path in sweeps:
+            run_parameter_sweep(
+                parameter=parameter,
+                values=values,
+                seeds=range(1,31),
+                csv_path=path,
+                make_plot=True,
+            )
+
+
+        
