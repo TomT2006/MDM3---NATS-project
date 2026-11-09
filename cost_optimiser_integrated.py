@@ -1,331 +1,118 @@
-"""ensemble sweep one model parameter. plots cost.
+"""Configurable weighted-penalty sweeps; uncertainty is across independent runs.
 
-eg:
-    rows = run_parameter_sweep(
-        "stands_per_port",
-        values=np.linspace(2, 8, 7),
-        seeds=(1, 2, 3),
-    )
-
-Note: code only works on my computer when i run "python "cost_optimiser_integrated.py"" from terminal.
-may work normally on your machine, but if it doesnt, type the above into terminal.
+This is a finite grid comparison, not an optimiser of the flight schedule.
+Money is not implied by the weights. No simulation starts on import.
 """
-import csv
+from dataclasses import asdict
 from copy import deepcopy
 from pathlib import Path
-from statistics import mean, pstdev
-
-import matplotlib.pyplot as plt
+import csv
+import math
 import numpy as np
+from model import ScenarioConfig, Simulation, example_config
+from results import audit
+from overload import score_run as assess_run, weighted_score, LEGACY_WEIGHTS
+from uncertainty import bootstrap_mean
 
-from model import ScenarioConfig, Simulation
-from results import measurements
-
-
-# baseline model inputs, subject to change
-BASELINE_PARAMETERS = {
-    "port_names": ("A", "B", "C", "D"),
-    "fleet": 8,
-    "seats": 4,
-    "stands_per_port": 4,
-    "queue_capacity": 4,
-    "chargers_per_port": 1,
-    "chargers_A": 2,
-    "chargers_B": 0,
-    "chargers_C": 1,
-    "chargers_D": 0,
-    "pads_per_port": 1,
-    "initial_soc": 0.9,
-    "routes_km": None,
-    "default_distance_km": 30.0,
-    "speed_kmh": 200.0,
-    "headway_min": 3.0,
-    "taxi_out_min": 1.0,
-    "pad_service_mean_min": 1.0,
-    "taxi_in_min": 1.0,
-    "board_min_per_passenger": 1.0,
-    "unload_min_per_passenger": 1.0,
-    "battery_kwh": 100.0,
-    "vertical_energy_kwh": 8.0,
-    "cruise_kwh_per_km": 0.4,
-    "charger_kw": 120.0,
-    "charging_efficiency": 1.0,
-    "reserve_soc": 0.15,
-    "charge_trigger_soc": 0.6,
-    "charge_target_soc": 0.9,
-    "holding_kw": 30.0,
-    "holding_quantile": 0.99,
-    "mission_energy_margin": 0.1,
-    "max_charger_wait_min": 60.0,
-    "total_demand_per_hour": 36.0,
-    "demand_per_hour": None,
-    "demand_mode": "poisson",
-    "timetable_interval_min": 30.0,
-    "service_intervals_min": {},
-    "first_departure_min": 10.0,
-    "max_assignment_delay_min": 30.0,
-    "decision_interval_min": 0.5,
-    "ground_delay_mean_min": 0.0,
-    "demand_stop_min": 600.0,
-    "horizon_min": 720.0,
-    "time_scale_min": 10.0,
-    "length_scale_km": 30.0,
-    "wait_target_min": 60.0,
-    "served_target": 0.95,
-    "timely_target": 0.95,
-}
-
-# cost function weightings
-COST_WEIGHTS = {
-    "passenger_wait_min": 1.0,
-    "uncompleted_passenger": 200.0,
-    "flight": 60.0,
-    "aircraft_hour": 50.0,
-}
-
-DEFAULT_MULTIPLIERS = np.linspace(0.5, 2.0, 10)
-
-INTEGER_PARAMETERS = {
-    "fleet",
-    "seats",
-    "stands_per_port",
-    "queue_capacity",
-    "chargers_per_port",
-    "chargers_A",
-    "chargers_B",
-    "chargers_C",
-    "chargers_D",
-    "pads_per_port",
-}
+BASELINE_PARAMETERS=asdict(example_config())
+COST_WEIGHTS=LEGACY_WEIGHTS.copy()
+DEFAULT_MULTIPLIERS=np.linspace(.5,2,10)
+INTEGER_PARAMETERS={'fleet','seats','stands_per_port','queue_capacity','chargers_per_port','pads_per_port'}
 
 
-def build_config(parameters, seed):
-    """creates a validated model configuration from baseline/sweep parameter values."""
-    config_values = deepcopy(parameters)
-    ports = config_values["port_names"]
-    
-    port_overrides = {}
-    for port in ports:
-        key = f"chargers_{port}"
-        if key in config_values:
-            port_overrides[port] = {"chargers": config_values.pop(key)}
-            
-    config_values["port_overrides"] = port_overrides
-    config_values["seed"] = seed
-    
-    config = ScenarioConfig(**config_values)
-    config.validate()
-    return config
+def build_config(parameters,seed):
+    values=deepcopy(parameters)
+    overrides=values.pop('port_overrides',{})
+    for key in list(values):
+        if key.startswith('chargers_') and key!='chargers_per_port':
+            port=key[len('chargers_'):]
+            if port not in values['port_names']:raise ValueError('Unknown port in charging override.')
+            overrides.setdefault(port,{})['chargers']=values.pop(key)
+    values.update(port_overrides=overrides,seed=int(seed))
+    c=ScenarioConfig(**values);c.validate();return c
 
 
-def calculate_cost(components, weights=COST_WEIGHTS):
-    #calculates cost duh
-    return (weights["passenger_wait_min"] * components["total_wait_min"]
-            + weights["uncompleted_passenger"] * components["uncompleted_passengers"] 
-            + weights["flight"] * components["flights"] 
-            + weights["aircraft_hour"] * components["aircraft_hours"])
+def calculate_cost(components,weights=None):
+    return weighted_score(components,weights)
 
 
-def score_run(simulation, weights=COST_WEIGHTS):
-    #returns cost components and model metrics for a completed simulation
-    config = simulation.config
-    metrics = measurements(simulation)
-    end = simulation.env.now
-    
-    total_wait_min = sum(
-        max(
-            0.0,
-            float(
-                (passenger.departed if passenger.departed is not None else end)
-                - passenger.arrived
-            )
-            * config.time_scale_min,
-        )
-        for passenger in simulation.passengers
-    )
-    
-    components = {
-        "total_wait_min": total_wait_min,
-        "uncompleted_passengers": metrics["arrivals"] - metrics["completed"],
-        "flights": metrics["flights"],
-        "aircraft_hours": config.fleet * config.horizon_min / 60.0,
-    }
-    
-    return {
-        "cost": calculate_cost(components, weights),
-        **components,
-        "arrivals": metrics["arrivals"],
-        "completed": metrics["completed"],
-        "mean_wait_min": metrics["mean_wait_min"],
-        "p95_wait_min": metrics["p95_wait_min"],
-        "served_fraction": metrics["served_fraction"],
-        "timely_fraction": metrics["timely_fraction"],
-        "reposition_flights": metrics["reposition_flights"],
-        "safety_failures": metrics["safety_failures"],
-    }
+def score_run(simulation,weights=None):
+    row,_,_=assess_run(simulation)
+    row['cost']=weighted_score(row,weights)
+    # A stopped failure is explicitly ineligible; partial costs remain inspectable.
+    row['ranking_eligible']=row['feasible']
+    return row
 
 
-def get_sweep_values(parameter, values, multipliers, baseline):
-
-    #determines the sequence of values to sweep.
-
-    if values is not None:
-        selected = list(values)
-    else:
-        selected = [baseline[parameter] * factor for factor in multipliers]
-
-    if parameter in INTEGER_PARAMETERS:
-        selected = [int(round(v)) for v in selected]
-        
+def get_sweep_values(parameter,values,multipliers,baseline):
+    selected=list(values) if values is not None else [baseline[parameter]*x for x in multipliers]
+    integer=parameter in INTEGER_PARAMETERS or parameter.startswith('chargers_')
+    if integer:
+        if any(not math.isfinite(v) or int(v)!=v for v in selected):
+            raise ValueError('Integer parameter sweeps require explicit integer values.')
+        selected=[int(v) for v in selected]
     return list(dict.fromkeys(selected))
 
 
-def get_seeds(seeds, value):
-    """returns the ensemble seeds for a given parameter value"""
-    if isinstance(seeds, dict):
-        return tuple(seeds.get(value, []))
-    return tuple(seeds)
+def get_seeds(seeds,value):
+    answer=tuple(seeds.get(value,())) if isinstance(seeds,dict) else tuple(seeds)
+    if not answer or len(set(answer))!=len(answer):raise ValueError('Distinct nonempty seed list required.')
+    return answer
 
 
-def run_parameter_sweep(
-    parameter,
-    values=None,
-    *,
-    multipliers=DEFAULT_MULTIPLIERS,
-    seeds=(1, 2, 3),
-    baseline=BASELINE_PARAMETERS,
-    cost_weights=COST_WEIGHTS,
-    csv_path="cost_sweep_results.csv",
-    make_plot=True,
-    show_progress=True,
-):
-    """runs an ensemble per value, saves the scored runs, and plots"""
-    parameter_values = get_sweep_values(parameter, values, multipliers, baseline)
-    seed_plan = [(value, get_seeds(seeds, value)) for value in parameter_values]
-    
-    total_runs = sum(len(s) for _, s in seed_plan)
-        
-    if show_progress:
-        print(f"Starting {total_runs} simulations for '{parameter}'.", flush=True)
-
-    rows = []
-    completed = 0
-
-    for value, selected_seeds in seed_plan:
-        for seed in selected_seeds:
-            run_parameters = deepcopy(baseline)
-            run_parameters[parameter] = value
-            
-            sim = Simulation(build_config(run_parameters, seed)).run()
-            rows.append({
-                "parameter": parameter,
-                "parameter_value": value,
-                "seed": seed,
-                **score_run(sim, cost_weights),
-            })
-            
-            completed += 1
-            if show_progress:
-                print(f"\rProgress: {completed}/{total_runs} | {parameter}={value} | seed={seed}", end="", flush=True)
-
-    if show_progress:
-        print(flush=True)
-
-    write_csv(rows, csv_path)
-    
-    if make_plot and rows:
-        plot_sweep_results(rows, parameter)
-        plt.show()
-        
+def run_parameter_sweep(parameter,values=None,*,multipliers=DEFAULT_MULTIPLIERS,seeds=(1,2,3),
+        baseline=None,cost_weights=None,csv_path='cost_sweep_results.csv',make_plot=True,show_progress=True):
+    baseline=deepcopy(BASELINE_PARAMETERS if baseline is None else baseline)
+    plan=[]
+    for value in get_sweep_values(parameter,values,multipliers,baseline):
+        for seed in get_seeds(seeds,value):
+            parameters=deepcopy(baseline);parameters[parameter]=value
+            # Validate the entire sweep before starting; invalid settings are not silently skipped.
+            plan.append((value,build_config(parameters,seed)))
+    rows=[]
+    for value,config in plan:
+        sim=Simulation(config).run();audit(sim)
+        rows.append(dict(parameter=parameter,parameter_value=value,**score_run(sim,cost_weights)))
+        if show_progress:print(f'{parameter}={value}, seed={config.seed}: audited',flush=True)
+    write_csv(rows,csv_path)
+    if make_plot:plot_sweep_results(rows,parameter)
     return rows
 
 
-def write_csv(rows, csv_path):
-    """writes one csv row per simulation replication."""
-    if not rows:
-        return
-        
-    path = Path(csv_path)
-    with path.open("w", newline="", encoding="utf-8") as output:
-        writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+def write_csv(rows,csv_path):
+    if not rows:return
+    path=Path(csv_path);path.parent.mkdir(parents=True,exist_ok=True)
+    with path.open('w',newline='') as f:
+        writer=csv.DictWriter(f,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
 
 
-def plot_sweep_results(rows, parameter, ax=None):
-    """plots the mean cost by parameter value, with std bars."""
-    grouped = {}
-    for row in rows:
-        val = float(row["parameter_value"])
-        cost = float(row["cost"])
-        grouped.setdefault(val, []).append(cost)
-        
-    x_values = sorted(grouped)
-    means = [mean(grouped[v]) for v in x_values]
-    deviations = [pstdev(grouped[v]) for v in x_values]
-
-    if ax is None:
-        _, ax = plt.subplots()
-        
-    ax.errorbar(x_values, means, yerr=deviations, marker="o", capsize=3)
-    ax.set_xlabel(parameter)
-    ax.set_ylabel("Cost")
-    ax.set_title(f"cost by {parameter}")
-    ax.grid(True, alpha=0.3)
+def plot_sweep_results(rows,parameter,ax=None):
+    import matplotlib.pyplot as plt
+    groups={}
+    for r in rows:
+        if str(r.get('ranking_eligible',True)).lower() not in ('true','1'):continue
+        groups.setdefault(float(r['parameter_value']),[]).append(float(r['cost']))
+    if not groups:raise ValueError('No eligible runs.')
+    levels=sorted(groups);stats=[bootstrap_mean(groups[v]) for v in levels]
+    if ax is None:_,ax=plt.subplots()
+    m=np.array([s['mean'] for s in stats]);lo=np.array([s['low'] for s in stats]);hi=np.array([s['high'] for s in stats])
+    ax.errorbar(levels,m,yerr=[np.maximum(0,m-lo),np.maximum(0,hi-m)],fmt='o-',capsize=3)
+    ax.set(xlabel=parameter,ylabel='Weighted penalty (not currency)',title='Mean and 95% whole-run bootstrap interval')
     return ax
 
 
 def plot_from_csv(csv_path):
-    """reads an existing csv file and produceses the cost plot without rerunning simulations."""
-    path = Path(csv_path)
-    if not path.exists():
-        print(f"File {csv_path} not found.")
-        return
-        
-    rows = []
-    with path.open("r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-            
-    if not rows:
-        print("file is empty.")
-        return
-        
-    parameter_name = rows[0].get("parameter", "unknown Parameter")
-    plot_sweep_results(rows, parameter_name)
-    plt.show()
+    with Path(csv_path).open() as f:rows=list(csv.DictReader(f))
+    return plot_sweep_results(rows,rows[0]['parameter'])
 
 
-if __name__ == "__main__":
-    
-    mode = input("type 1 to run a new simulation sweep, or 2 to plot from an existing csv: ").strip()
-    
-    if mode == '2':
-        target_file = input("enter the csv filename. example file is [stands_sweep.csv]: ").strip()
-        plot_from_csv(target_file)
-    else:
-        # example scenario
-        # in this example the cost function decreases SIGNIFICANTLY going from 2 stands per port to 3.
-        rows = run_parameter_sweep(
-            parameter="stands_per_port",
-            values=np.linspace(2, 8, 7),
-            seeds=range(1,31),
-            csv_path="stands_sweep.csv",
-            make_plot=True,
-        )
-        sweeps = [("fleet", range(4,13), "fleet_sweep.csv"),
-                  ("stands_per_port", [1,2,3,4], "stands_sweep.csv"),
-        ]
-
-        for parameter, values, path in sweeps:
-            run_parameter_sweep(
-                parameter=parameter,
-                values=values,
-                seeds=range(1,31),
-                csv_path=path,
-                make_plot=True,
-            )
-
-
-        
+if __name__=='__main__':
+    import argparse
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--plot-csv',type=Path)
+    args=parser.parse_args()
+    if args.plot_csv:
+        plot_from_csv(args.plot_csv)
+        import matplotlib.pyplot as plt
+        plt.show()
+    else:parser.print_help()

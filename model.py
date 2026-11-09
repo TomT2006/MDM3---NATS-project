@@ -488,7 +488,7 @@ class Simulation:
         c = self.config
         self.env, self.log = simpy.Environment(), Recorder()
         self.failure_event = self.env.event()
-        self.ports = {p: Vertiport(self.env, c.capacities(p), c.seed+2000003+i, c.time_scale_min)
+        self.ports = {p: Vertiport(self.env, c.capacities(p), f"{c.seed}:pad:{p}", c.time_scale_min)
                       for i,p in enumerate(c.port_names)}
         self.routes = {(a, b): Route(a, b, c.time(60 * d / c.speed_kmh), c.energy(d))
                        for (a, b), d in c.network().items()}
@@ -510,14 +510,14 @@ class Simulation:
             for _ in range(count):
                 self.aircraft.append(Aircraft(self, f"A{len(self.aircraft) + 1}", port))
         self.log.allocations.append((0, counts.copy()))
-        self.delay_rng = {a.name: random.Random(c.seed + 100000 + i) for i, a in enumerate(self.aircraft)}
+        self.delay_rng = {a.name: random.Random(f"{c.seed}:ground-delay:{a.name}") for i, a in enumerate(self.aircraft)}
         self.passengers, self.waiting = [], {r: [] for r in self.routes}
         self.flights = self._schedule(flight_schedule)
         self.scheduler = Scheduler(self)
         if passenger_arrivals is None:
             for i, (route, rate) in enumerate(sorted(c.demand().items())):
                 if rate:
-                    self.env.process(self._demand(route, rate, random.Random(c.seed + 1009 * (i + 1))))
+                    self.env.process(self._demand(route, rate, random.Random(f"{c.seed}:demand:{route[0]}:{route[1]}")))
         else:
             arrivals = sorted(passenger_arrivals)
             if any(not isfinite(t) or not 0 <= t < c.demand_stop_min or (a, b) not in self.routes for t, a, b in arrivals):
