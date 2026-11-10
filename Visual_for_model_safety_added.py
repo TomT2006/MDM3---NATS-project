@@ -1,267 +1,396 @@
-import sys
-import os
 import math
+import os
+import random
+import sys
 import tkinter as tk
 from tkinter import ttk
-import numpy as np
 
-# Ensure local directory is in Python path
+# ---------------------------------------------------------------------------
+# 1. IMPORT SAFETY MODEL & CONFIGURATION
+# ---------------------------------------------------------------------------
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Prevent Matplotlib from spawning background popups/windows
 import matplotlib
-matplotlib.use('Agg')
+
+matplotlib.use('TkAgg')
 
 try:
-    from model import ScenarioConfig, Simulation, example_config
-    from results import measurements
+  from model import ScenarioConfig, Simulation, example_config
+  from results import measurements
 except ImportError as e:
-    raise ImportError(
-        f"Missing required model files in {os.getcwd()}.\n"
-        "Ensure model.py, queues.py, safety.py, results.py, mm1k.py, and plots.py "
-        "are all present in this folder!"
-    ) from e
+  raise ImportError(
+      f'Missing required model files in {os.getcwd()}.\n'
+      'Ensure model.py, queues.py, safety.py, results.py, mm1k.py, and'
+      ' plots.py are present!'
+  ) from e
 
-# =============================================================================
-# ⚙️ SIMULATION CONFIGURATION PARAMETERS (CHANGE VALUES HERE)
-# =============================================================================
-FLEET_SIZE = 10               # Total aircraft in network
-STANDS_PER_PORT = 4           # Capacity / chargers per vertiport
-HEADWAY_MIN = 3               # Dispatch interval in minutes
-BATTERY_KWH = 100             # Aircraft battery capacity (kWh)
-CHARGER_KW = 120              # Charger power output (kW)
-SPEED_KMH = 200               # Cruise speed (km/h)
-PORT_NAMES = ('A', 'B', 'C', 'D')
-HORIZON_MIN = 720             # Total simulation duration (minutes)
-FRAME_INTERVAL_MS = 30        # Animation frame delay in ms (Lower = smoother)
-# =============================================================================
+import simpy
 
+# ---------------------------------------------------------------------------
+# 2. GUI SIMULATION DASHBOARD (Driven by Model Config)
+# ---------------------------------------------------------------------------
+class eVTOLSafetyVisualizer:
 
-class eVTOLNetworkDashboard:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("UAM Real-Time Spatial Network Dashboard")
-        self.root.geometry("1200x800")
+  def __init__(self, root):
+    self.root = root
+    self.root.title("NATS eVTOL Real-Time Fleet Simulator (Safety Model)")
+    self.root.geometry("1100x750")
 
-        # 2D Screen Coordinates for Vertiports A, B, C, D
-        self.port_coords = {
-            'A': (220, 160),
-            'B': (220, 520),
-            'C': (580, 520),
-            'D': (580, 160)
-        }
+    # Simulation control flags
+    self.is_running = False
+    self.sim_speed = 1.0
 
-        # Full mesh routes connecting all node pairs (including B <-> D diagonal)
-        self.routes = [
-            ('A', 'B'), ('B', 'C'), ('C', 'D'), ('D', 'A'),
-            ('A', 'C'), ('B', 'D')
-        ]
+    # Vertiport 2D Screen Positions (4-Port Diamond Topology for A, B, C, D)
+    self.port_coords = {
+        "A": (300, 150),  # Top
+        "B": (150, 420),  # Left
+        "C": (450, 420),  # Right
+        "D": (300, 600),  # Bottom
+    }
 
-        self.is_playing = True
-        self.current_time_idx = 0
+    # Initialize model scenario config
+    self.config = example_config(
+        port_names=("A", "B", "C", "D"),
+        fleet=8,
+        seats=4,
+        stands_per_port=4,
+        queue_capacity=4,
+        pad_service_mean_min=1,
+        default_distance_km=30,
+        speed_kmh=200,
+        total_demand_per_hour=36,
+        timetable_interval_min=30,
+        headway_min=3,
+        battery_kwh=100,
+        charger_kw=120,
+        demand_stop_min=600,
+        horizon_min=720,
+        seed=42,
+        holding_kw=30,
+        holding_quantile=0.99,
+        mission_energy_margin=0.10,
+        max_charger_wait_min=60,
+    )
+    self.config.validate()
 
-        self._build_gui()
-        self._run_model_simulation()
-        self.animate()
+    self.fleet_size = self.config.fleet
 
-    def _build_gui(self):
-        # Clean Header Bar (Control inputs moved to top code block)
-        top_bar = ttk.Frame(self.root, padding=8)
-        top_bar.pack(fill=tk.X)
+    # Track live aircraft state for rendering
+    self.aircraft_states = {}
+    for i in range(self.fleet_size):
+      start_port = self.config.port_names[i % len(self.config.port_names)]
+      self.aircraft_states[i] = {
+          "id": i,
+          "x": self.port_coords[start_port][0],
+          "y": self.port_coords[start_port][1],
+          "origin": start_port,
+          "destination": start_port,
+          "battery": 100.0,
+          "status": "Idle",  # In-Flight, Charging, Queued, Boarding, Idle
+          "sched_dep": 0.0,
+          "queue_pos": None,
+      }
 
-        self.btn_play = ttk.Button(top_bar, text="⏸ Pause", command=self.toggle_play)
-        self.btn_play.pack(side=tk.LEFT, padx=5)
+    self._setup_gui()
+    self._setup_simulation()
 
-        self.lbl_time = ttk.Label(top_bar, font=("Helvetica", 11, "bold"), text="Sim Time: 0.0 / 720 min")
-        self.lbl_time.pack(side=tk.RIGHT, padx=15)
+  def _setup_gui(self):
+    # Top Control Bar
+    control_frame = ttk.Frame(self.root, padding=10)
+    control_frame.pack(fill=tk.X)
 
-        # Time Scrub Bar
-        slider_frame = ttk.Frame(self.root, padding=(10, 0, 10, 5))
-        slider_frame.pack(fill=tk.X)
-        self.time_slider = ttk.Scale(slider_frame, from_=0, to=HORIZON_MIN, value=0, command=self.on_slider_scrub)
-        self.time_slider.pack(fill=tk.X)
+    self.btn_start = ttk.Button(
+        control_frame, text="▶ Play", command=self.toggle_sim
+    )
+    self.btn_start.pack(side=tk.LEFT, padx=5)
 
-        # Main Workspace: 2D Canvas (Left) + Live Telemetry Sidebar (Right)
-        main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+    ttk.Label(control_frame, text="Speed:").pack(side=tk.LEFT, padx=(15, 2))
+    self.speed_scale = ttk.Scale(
+        control_frame,
+        from_=0.5,
+        to=10.0,
+        value=1.0,
+        command=self.update_speed,
+    )
+    self.speed_scale.pack(side=tk.LEFT, padx=5)
 
-        canvas_frame = ttk.Frame(main_pane)
-        self.canvas = tk.Canvas(canvas_frame, bg="#181825", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-        main_pane.add(canvas_frame, weight=3)
+    self.lbl_time = ttk.Label(
+        control_frame,
+        text="Sim Time: 0.0 min",
+        font=("Helvetica", 11, "bold"),
+    )
+    self.lbl_time.pack(side=tk.RIGHT, padx=15)
 
-        sidebar = ttk.Frame(main_pane, padding=5)
-        main_pane.add(sidebar, weight=2)
+    # Main Layout: Canvas (Left) + Live Data Sidebar (Right)
+    main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+    main_pane.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        ttk.Label(sidebar, text="Live Fleet Telemetry", font=("Helvetica", 12, "bold")).pack(anchor=tk.W, pady=5)
+    canvas_frame = ttk.Frame(main_pane)
+    self.canvas = tk.Canvas(canvas_frame, bg="#1e1e2f", highlightthickness=0)
+    self.canvas.pack(fill=tk.BOTH, expand=True)
+    main_pane.add(canvas_frame, weight=3)
 
-        self.lbl_metrics = ttk.Label(sidebar, font=("Courier", 9), justify=tk.LEFT, relief="solid", padding=6)
-        self.lbl_metrics.pack(fill=tk.X, pady=(0, 10))
+    sidebar_frame = ttk.Frame(main_pane, padding=5)
+    main_pane.add(sidebar_frame, weight=2)
 
-        cols = ("Aircraft", "Leg/Status", "SOC (%)", "Safety Gate")
-        self.tree = ttk.Treeview(sidebar, columns=cols, show="headings", height=22)
-        for c in cols:
-            self.tree.heading(c, text=c)
-            self.tree.column(c, width=80, anchor=tk.CENTER)
-        self.tree.pack(fill=tk.BOTH, expand=True)
+    ttk.Label(
+        sidebar_frame, text="Live Fleet Telemetry", font=("Helvetica", 12, "bold")
+    ).pack(anchor=tk.W, pady=5)
 
-        self._init_canvas_objects()
+    # Telemetry Treeview
+    columns = ("ID", "Status", "SOC (%)", "Dest", "Queue #", "Sched Dep")
+    self.tree = ttk.Treeview(
+        sidebar_frame, columns=columns, show="headings", height=25
+    )
 
-    def _run_model_simulation(self):
-        """Builds and executes simulation using parameters defined at top of script."""
-        self.config = example_config(
-            port_names=PORT_NAMES, fleet=FLEET_SIZE, seats=4,
-            stands_per_port=STANDS_PER_PORT, queue_capacity=4, pad_service_mean_min=1,
-            default_distance_km=30, speed_kmh=SPEED_KMH,
-            total_demand_per_hour=36, timetable_interval_min=30,
-            headway_min=HEADWAY_MIN, battery_kwh=BATTERY_KWH, charger_kw=CHARGER_KW,
-            demand_stop_min=600, horizon_min=HORIZON_MIN, seed=42,
-            holding_kw=30, holding_quantile=0.99,
-            mission_energy_margin=0.10, max_charger_wait_min=60,
+    for col in columns:
+      self.tree.heading(col, text=col)
+      self.tree.column(col, width=65, anchor=tk.CENTER)
+    self.tree.column("Status", width=90)
+
+    self.tree.pack(fill=tk.BOTH, expand=True)
+
+  def _setup_simulation(self):
+    self.env = simpy.Environment()
+
+    # Create chargers at vertiports
+    self.chargers = {
+        p: simpy.PriorityResource(
+            self.env, capacity=self.config.stands_per_port
         )
-        self.config.validate()
+        for p in self.config.port_names
+    }
 
-        self.sim = Simulation(self.config).run()
-        self.metrics = measurements(self.sim)
+    # Generate flight plans across network
+    rng = random.Random(self.config.seed)
+    flight_dur = (
+        60.0 * self.config.default_distance_km
+    ) / self.config.speed_kmh
+    energy_used = (
+        self.config.energy(self.config.default_distance_km) * 100.0
+    )  # % SOC used per flight
 
-        self.num_frames = 721
-        self.time_steps = np.linspace(0, HORIZON_MIN, self.num_frames)
-        self.time_slider.config(to=HORIZON_MIN)
+    for i in range(self.fleet_size):
+      start_port = self.config.port_names[i % len(self.config.port_names)]
+      plan = []
+      curr = start_port
+      t = (i * 7 % 11) / 2.0 + 5.0
 
-    def _init_canvas_objects(self):
-        """Pre-allocates static and animated canvas elements for zero-lag rendering."""
-        self.canvas.delete("all")
-
-        # Static Route Connections (including B-D and A-C diagonals)
-        for p1, p2 in self.routes:
-            x1, y1 = self.port_coords[p1]
-            x2, y2 = self.port_coords[p2]
-            self.canvas.create_line(x1, y1, x2, y2, fill="#313244", width=2, dash=(4, 4))
-
-        # Static Vertiport Nodes
-        for name, (x, y) in self.port_coords.items():
-            self.canvas.create_oval(x - 28, y - 28, x + 28, y + 28, fill="#2b5c8f", outline="#89b4fa", width=2.5)
-            self.canvas.create_text(x, y, text=f"Port {name}", fill="white", font=("Helvetica", 10, "bold"))
-
-        # Pre-create Aircraft Glyphs
-        self.ac_dots = {}
-        self.ac_texts = {}
-        self.ac_subtexts = {}
-        for i in range(FLEET_SIZE):
-            dot = self.canvas.create_oval(0, 0, 0, 0, fill="#a6e3a1", outline="white", width=1.5)
-            txt = self.canvas.create_text(0, 0, text=str(i+1), fill="black", font=("Helvetica", 8, "bold"))
-            sub = self.canvas.create_text(0, 0, text="", fill="white", font=("Helvetica", 7))
-            self.ac_dots[i] = dot
-            self.ac_texts[i] = txt
-            self.ac_subtexts[i] = sub
-
-        # Legend Panel
-        lx, ly = 20, 600
-        self.canvas.create_rectangle(lx - 10, ly - 10, lx + 140, ly + 95, fill="#11111b", outline="#313244")
-        self.canvas.create_text(lx + 5, ly, text="Legend", fill="white", font=("Helvetica", 9, "bold"), anchor=tk.W)
-        items = [("🟢 In-Flight", "#a6e3a1"), ("🟡 Charging", "#f9e2af"), ("⚪ Ground/Idle", "#bac2de")]
-        for idx, (label, col) in enumerate(items):
-            self.canvas.create_oval(lx + 5, ly + 20 + idx * 20, lx + 13, ly + 28 + idx * 20, fill=col)
-            self.canvas.create_text(lx + 20, ly + 24 + idx * 20, text=label[2:], fill="white", font=("Helvetica", 8), anchor=tk.W)
-
-    def toggle_play(self):
-        self.is_playing = not self.is_playing
-        self.btn_play.config(text="⏸ Pause" if self.is_playing else "▶ Play")
-
-    def animate(self):
-        if self.is_playing:
-            if self.current_time_idx < self.num_frames - 1:
-                self.current_time_idx += 1
-            else:
-                self.current_time_idx = 0  # Loop upon completion
-
-            self.time_slider.set(self.time_steps[self.current_time_idx])
-            self.update_view()
-
-        self.root.after(FRAME_INTERVAL_MS, self.animate)
-
-    def on_slider_scrub(self, val):
-        target_t = float(val)
-        self.current_time_idx = int((target_t / HORIZON_MIN) * (self.num_frames - 1))
-        self.update_view()
-
-    def update_view(self):
-        current_t = self.time_steps[self.current_time_idx]
-        self.lbl_time.config(text=f"Sim Time: {current_t:.1f} / {HORIZON_MIN:.0f} min")
-
-        metrics_text = (
-            f"Served Fraction: {self.metrics.get('served_fraction', 0.0)*100:.1f}%\n"
-            f"Timely Fraction: {self.metrics.get('timely_fraction', 0.0)*100:.1f}%\n"
-            f"Safety Failures: {self.metrics.get('safety_failures', 0)}\n"
-            f"Min Network SOC: {self.metrics.get('minimum_soc', 1.0)*100:.1f}%"
+      for _ in range(40):
+        dest = rng.choice(
+            [p for p in self.config.port_names if p != curr]
         )
-        self.lbl_metrics.config(text=metrics_text)
+        plan.append({
+            "origin": curr,
+            "destination": dest,
+            "flight_minutes": flight_dur,
+            "battery_use": energy_used,
+            "scheduled_departure": t,
+        })
+        t += flight_dur + 15.0 + 5.0
+        curr = dest
 
-        # Update Aircraft Positions on Canvas
-        self.update_canvas_positions(current_t)
-        
-        # Update Right Telemetry Table
-        self.update_telemetry(current_t)
+      ac_data = {
+          "id": i,
+          "port": start_port,
+          "battery": 100.0,
+          "flight_plan": plan,
+          "start_delay": (i * 7 % 11) / 2.0,
+      }
+      self.env.process(self._visual_evtol_process(ac_data))
 
-    def update_canvas_positions(self, current_t):
-        for i in range(FLEET_SIZE):
-            # Route assignment pattern across network pairs (includes B-D leg)
-            route = self.routes[i % len(self.routes)]
-            p_orig, p_dest = route
+  def _visual_evtol_process(self, aircraft):
+    ac_id = aircraft["id"]
+    yield self.env.timeout(aircraft["start_delay"])
 
-            x1, y1 = self.port_coords[p_orig]
-            x2, y2 = self.port_coords[p_dest]
+    port = aircraft["port"]
+    battery = aircraft["battery"]
 
-            phase = (current_t + i * 25) % 120
-            progress = (phase % 30) / 30.0
-            soc = max(0.15, 1.0 - 0.65 * progress)
+    for journey in aircraft["flight_plan"]:
+      dest = journey["destination"]
+      flight_min = journey["flight_minutes"]
+      batt_use = journey["battery_use"]
+      sched_dep = journey["scheduled_departure"]
 
-            if progress < 0.20 or progress > 0.80:
-                # Ground/Charging state at node
-                angle = (i * 36) % 360
-                px = (x1 if progress < 0.20 else x2) + 40 * math.cos(math.radians(angle))
-                py = (y1 if progress < 0.20 else y2) + 40 * math.sin(math.radians(angle))
-                color = "#f9e2af" if soc < 0.5 else "#bac2de"
-            else:
-                # Active Transit along assigned route
-                px = x1 + (x2 - x1) * progress
-                py = y1 + (y2 - y1) * progress
-                color = "#a6e3a1"
+      req_batt = batt_use + 10.0  # Reserve margin
 
-            # Smooth object repositioning
-            self.canvas.coords(self.ac_dots[i], px - 9, py - 9, px + 9, py + 9)
-            self.canvas.itemconfig(self.ac_dots[i], fill=color)
-            self.canvas.coords(self.ac_texts[i], px, py)
-            self.canvas.coords(self.ac_subtexts[i], px, py - 15)
-            self.canvas.itemconfig(self.ac_subtexts[i], text=f"AC-{i+1} ({soc*100:.0f}%)")
+      self.aircraft_states[ac_id].update({
+          "origin": port,
+          "destination": dest,
+          "battery": battery,
+          "sched_dep": sched_dep,
+          "status": "Ground",
+          "queue_pos": None,
+      })
 
-    def update_telemetry(self, current_t):
-        # Refresh telemetry table rows
-        for r in self.tree.get_children():
-            self.tree.delete(r)
+      # Check if charging is required before departure
+      if battery < req_batt:
+        self.aircraft_states[ac_id]["status"] = "Queued"
+        charge_min = (
+            (100.0 - battery) / (self.config.charger_kw / self.config.battery_kwh)
+        ) / 60.0
 
-        for i in range(FLEET_SIZE):
-            p_orig, p_dest = self.routes[i % len(self.routes)]
-            phase = (current_t + i * 25) % 120
-            progress = (phase % 30) / 30.0
-            soc = max(0.15, 1.0 - 0.65 * progress)
+        req = self.chargers[port].request(
+            priority=sched_dep - self.env.now
+        )
+        with req as r:
+          self.aircraft_states[ac_id]["queue_pos"] = len(
+              self.chargers[port].queue
+          )
+          yield r
+          self.aircraft_states[ac_id]["queue_pos"] = "Charging"
+          self.aircraft_states[ac_id]["status"] = "Charging"
 
-            if 0.20 <= progress <= 0.80:
-                status = f"{p_orig} ➔ {p_dest}"
-            else:
-                status = "Ground/Charge"
+          charge_steps = 10
+          for _ in range(charge_steps):
+            yield self.env.timeout(charge_min / charge_steps)
+            battery += (100.0 - battery) / charge_steps
+            self.aircraft_states[ac_id]["battery"] = min(100.0, battery)
 
-            safety_gate = "✅ Approved" if soc >= 0.20 else "⚠️ Margin Low"
+      # Hold for scheduled departure
+      if self.env.now < sched_dep:
+        self.aircraft_states[ac_id]["status"] = "Boarding"
+        yield self.env.timeout(sched_dep - self.env.now)
 
-            self.tree.insert("", tk.END, values=(
-                f"AC-{i+1}",
-                status,
-                f"{soc*100:.1f}%",
-                safety_gate
-            ))
+      # Flight Phase
+      self.aircraft_states[ac_id]["status"] = "In-Flight"
+
+      flight_steps = 20
+      start_x, start_y = self.port_coords[port]
+      end_x, end_y = self.port_coords[dest]
+
+      for step in range(1, flight_steps + 1):
+        yield self.env.timeout(flight_min / flight_steps)
+        progress = step / flight_steps
+        self.aircraft_states[ac_id]["x"] = start_x + (
+            end_x - start_x
+        ) * progress
+        self.aircraft_states[ac_id]["y"] = start_y + (
+            end_y - start_y
+        ) * progress
+        self.aircraft_states[ac_id]["battery"] = battery - (
+            batt_use * progress
+        )
+
+      battery -= batt_use
+      port = dest
+      (
+          self.aircraft_states[ac_id]["x"],
+          self.aircraft_states[ac_id]["y"],
+      ) = self.port_coords[port]
+
+  def update_speed(self, val):
+    self.sim_speed = float(val)
+
+  def toggle_sim(self):
+    self.is_running = not self.is_running
+    self.btn_start.config(text="⏸ Pause" if self.is_running else "▶ Play")
+    if self.is_running:
+      self.run_loop()
+
+  def run_loop(self):
+    if not self.is_running:
+      return
+
+    try:
+      self.env.step()
+      self.lbl_time.config(text=f"Sim Time: {self.env.now:.1f} min")
+      self.draw_canvas()
+      self.update_telemetry()
+
+      delay = int(50 / self.sim_speed)
+      self.root.after(delay, self.run_loop)
+    except simpy.EmptySchedule:
+      self.lbl_time.config(text="Simulation Complete!")
+      self.is_running = False
+
+  def draw_canvas(self):
+    self.canvas.delete("all")
+
+    # Draw Flight Paths (Lines between Vertiports)
+    ports = list(self.port_coords.keys())
+    for i in range(len(ports)):
+      for j in range(i + 1, len(ports)):
+        p1, p2 = ports[i], ports[j]
+        x1, y1 = self.port_coords[p1]
+        x2, y2 = self.port_coords[p2]
+        self.canvas.create_line(
+            x1, y1, x2, y2, fill="#3a3a5c", width=2, dash=(4, 4)
+        )
+
+    # Draw Vertiport Nodes
+    for name, (x, y) in self.port_coords.items():
+      self.canvas.create_oval(
+          x - 25,
+          y - 25,
+          x + 25,
+          y + 25,
+          fill="#2b5c8f",
+          outline="#61afef",
+          width=3,
+      )
+      self.canvas.create_text(
+          x, y, text=f"Port {name}", fill="white", font=("Helvetica", 10, "bold")
+      )
+
+    # Draw Aircraft Icons & Badges
+    for ac_id, ac in self.aircraft_states.items():
+      x, y = ac["x"], ac["y"]
+
+      if ac["status"] != "In-Flight":
+        offset_angle = (ac_id * 45) % 360
+        x += 35 * math.cos(math.radians(offset_angle))
+        y += 35 * math.sin(math.radians(offset_angle))
+
+      color = (
+          "#98c379"
+          if ac["status"] == "In-Flight"
+          else ("#e5c07b" if ac["status"] == "Charging" else "#e06c75")
+      )
+
+      self.canvas.create_oval(
+          x - 10, y - 10, x + 10, y + 10, fill=color, outline="white", width=1.5
+      )
+      self.canvas.create_text(
+          x, y, text=str(ac_id + 1), fill="black", font=("Helvetica", 8, "bold")
+      )
+
+      q_info = (
+          f" [Q#{ac['queue_pos']}]"
+          if ac["queue_pos"] not in (None, "Charging")
+          else ""
+      )
+      label_text = (
+          f"AC-{ac_id+1} | {ac['battery']:.0f}% -> {ac['destination']}{q_info}"
+      )
+      self.canvas.create_text(
+          x, y - 18, text=label_text, fill="white", font=("Helvetica", 8)
+      )
+
+  def update_telemetry(self):
+    for row in self.tree.get_children():
+      self.tree.delete(row)
+
+    for ac_id, ac in self.aircraft_states.items():
+      q_str = str(ac["queue_pos"]) if ac["queue_pos"] is not None else "-"
+      self.tree.insert(
+          "",
+          tk.END,
+          values=(
+              f"AC-{ac_id+1}",
+              ac["status"],
+              f"{ac['battery']:.1f}%",
+              ac["destination"],
+              q_str,
+              f"{ac['sched_dep']:.1f}m",
+          ),
+      )
 
 
+# ---------------------------------------------------------------------------
+# 3. MAIN EXECUTION
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = eVTOLNetworkDashboard(root)
-    root.mainloop()
+  root = tk.Tk()
+  app = eVTOLSafetyVisualizer(root)
+  root.mainloop()
