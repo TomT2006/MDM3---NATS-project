@@ -1,0 +1,13 @@
+metric,option,mean,low,high,n,resamples
+Waiting before boarding (passenger-hours/day),One charger per port,110.08713860120103,106.72331982672719,113.50956066202673,80,5000
+Waiting before boarding (passenger-hours/day),Two chargers per port,78.9450552678677,77.01084644102234,80.89646462959196,80,5000
+Time after boarding (passenger-hours/day),One charger per port,109.88260238234948,108.20400798126343,111.49009073533671,80,5000
+Time after boarding (passenger-hours/day),Two chargers per port,107.30346954863012,105.75212838988305,108.82271598575026,80,5000
+Grid energy including battery restoration (kWh/day),One charger per port,4030.0974419121458,3998.633676394713,4061.975958785949,80,5000
+Grid energy including battery restoration (kWh/day),Two chargers per port,4574.436489301469,4532.312714209387,4614.916684420305,80,5000
+Flights/day,One charger per port,200.95,199.3746875,202.5375,80,5000
+Flights/day,Two chargers per port,227.9125,225.8121875,229.925,80,5000
+Unfinished passengers/day,One charger per port,0.7625,0.425,1.1375,80,5000
+Unfinished passengers/day,Two chargers per port,0.9625,0.675,1.2875,80,5000
+Runs with any unfinished journey (fraction),One charger per port,0.2625,0.1625,0.3625,80,5000
+Runs with any unfinished journey (fraction),Two chargers per port,0.5,0.3875,0.6125,80,5000
