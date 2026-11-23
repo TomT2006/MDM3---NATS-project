@@ -13,7 +13,7 @@ import random
 import simpy
 from queues import AircraftPadQueue
 from safety import SafetyPolicy
-
+from math import hypot
 
 @dataclass
 class ScenarioConfig:
@@ -613,11 +613,19 @@ class Simulation:
         self.env.run(until=self.env.timeout(end-self.env.now) | self.failure_event)
         return self
 
+def square_routes(side_km=30, ndigits=3):
+    """Directed routes for ports on the corners of a square.
+    A top-left, B top-right, C bottom-left, D bottom-right."""
+    xy = {"A": (0, 0), "B": (side_km, 0), "C": (0, side_km), "D": (side_km, side_km)}
+    return {(a, b): round(hypot(xy[a][0] - xy[b][0], xy[a][1] - xy[b][1]), ndigits)
+            for a in xy for b in xy if a != b}
 
 def example_config(**changes):
     """Four-port example; all other networks use the same classes."""
     overrides = {"A": {"chargers": 2}, "B": {"chargers": 0}, "D": {"chargers": 0}}
     ports = changes.get("port_names", ScenarioConfig.port_names)
     defaults = dict(port_overrides={p: v for p, v in overrides.items() if p in ports})
+    if tuple(ports) == ("A", "B", "C", "D"):
+        defaults["routes_km"] = square_routes()
     defaults.update(changes)
     return ScenarioConfig(**defaults)
